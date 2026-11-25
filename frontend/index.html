@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Rewritten by the backend when server.base_path is set (issue #107):
+         the base tag anchors the relative asset URLs, the meta tag tells the
+         app which prefix it is mounted under. Keep both tags. -->
+    <base href="/" />
+    <meta name="garage-ui-base-path" content="" />
+    <link rel="icon" type="image/png" href="./garage.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Garage UI</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

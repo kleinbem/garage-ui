@@ -1,0 +1,521 @@
+package routes
+
+import (
+	"Noooste/garage-ui/internal/auth"
+	"Noooste/garage-ui/internal/authz"
+	"Noooste/garage-ui/internal/config"
+	"Noooste/garage-ui/internal/handlers"
+	"Noooste/garage-ui/internal/middleware"
+	"Noooste/garage-ui/pkg/logger"
+	"html"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/gofiber/fiber/v3"
+	// Swagger imports
+	_ "Noooste/garage-ui/docs"
+
+	"github.com/Noooste/swagger"
+)
+
+// SetupRoutes configures all API routes
+func SetupRoutes(
+	app *fiber.App,
+	cfg *config.Config,
+	authService *auth.Service,
+	healthHandler *handlers.HealthHandler,
+	bucketHandler *handlers.BucketHandler,
+	objectHandler *handlers.ObjectHandler,
+	userHandler *handlers.UserHandler,
+	clusterHandler *handlers.ClusterHandler,
+	monitoringHandler *handlers.MonitoringHandler,
+	capabilitiesHandler *handlers.CapabilitiesHandler,
+	az *authz.Middleware,
+) {
+	// Apply CORS middleware globally
+	app.Use(middleware.CORSMiddleware(&cfg.CORS))
+
+	// Subpath support (issue #107): server.base_path is what the browser is
+	// told - the asset base href injected into index.html, the SPA's router and
+	// API base, the OIDC redirect URI and the session cookie scope. Accepting
+	// the prefix on the way in is middleware.StripBasePath's job, installed in
+	// main.go ahead of the request-id and access-log middleware.
+	basePath := cfg.Server.NormalizedBasePath()
+	// Cookie paths need the trailing slash; at the root this is "/", i.e. the
+	// historical default.
+	cookiePath := basePath + "/"
+
+	// Health check endpoint (no auth required)
+	app.Get("/health", healthHandler.Check)
+	app.Get("/api/v1/health", healthHandler.Check)
+
+	// Swagger documentation endpoint (no auth required)
+	app.Get("/docs/*", swagger.HandlerDefault)
+
+	// Create auth handler
+	authHandler := handlers.NewAuthHandler(cfg, authService)
+
+	// Auth configuration endpoint (always accessible, no auth required)
+	app.Get("/auth/config", authHandler.GetAuthConfig)
+
+	// Public Prometheus metrics endpoint (no auth), opt-in via auth.metrics_public.
+	// Registered outside /api/v1 so it bypasses the AuthMiddleware/ResolveSubject
+	// cascade and the VerifyRouteCoverage fail-closed guard entirely; the
+	// authenticated /api/v1/monitoring/metrics route is unaffected. Because it is
+	// registered before the SPA fallback below, Fiber matches it first.
+	// Protect it at the network layer (NetworkPolicy / trusted scrape network).
+	if cfg.Auth.MetricsPublic {
+		app.Get("/metrics", monitoringHandler.GetMetrics)
+	}
+
+	// API v1 group
+	api := app.Group("/api/v1")
+
+	// Apply authentication middleware to all API routes
+	api.Use(middleware.AuthMiddleware(&cfg.Auth, authService))
+
+	// Resolve the authz Subject once per request, right after authentication.
+	api.Use(az.ResolveSubject())
+
+	api.Get("/capabilities", capabilitiesHandler.GetCapabilities)
+
+	// Bucket routes
+	buckets := api.Group("/buckets")
+	{
+		buckets.Get("/", az.Require(authz.ScopeNone, authz.PermBucketList), bucketHandler.ListBuckets)                                                                        // List all buckets
+		buckets.Post("/", az.Require(authz.BucketFromBody(), authz.PermBucketCreate), bucketHandler.CreateBucket)                                                             // Create a new bucket
+		buckets.Get("/:name", az.Require(authz.BucketFromParam("name"), authz.PermBucketRead), bucketHandler.GetBucketInfo)                                                   // Get bucket info
+		buckets.Delete("/:name", az.Require(authz.BucketFromParam("name"), authz.PermBucketDelete), bucketHandler.DeleteBucket)                                               // Delete a bucket
+		buckets.Post("/:name/permissions", az.Require(authz.BucketFromParam("name"), authz.PermAllowBucketKey, authz.PermDenyBucketKey), bucketHandler.GrantBucketPermission) // Grant bucket permissions (allow+deny)
+		buckets.Put("/:name/website", az.Require(authz.BucketFromParam("name"), authz.PermBucketUpdate), bucketHandler.UpdateBucketWebsite)                                   // Update bucket website configuration
+		buckets.Put("/:name/quotas", az.Require(authz.BucketFromParam("name"), authz.PermBucketUpdate), bucketHandler.UpdateBucketQuotas)                                     // Update bucket quotas
+	}
+
+	// Object routes
+	objects := api.Group("/buckets/:bucket/objects")
+	{
+		objects.Get("/", az.Require(authz.BucketFromParam("bucket"), authz.PermObjectList), objectHandler.ListObjects)                             // List objects in bucket
+		objects.Post("/", az.Require(authz.BucketFromParam("bucket"), authz.PermObjectWrite), objectHandler.UploadObject)                          // Upload object (multipart)
+		objects.Post("/upload-multiple", az.Require(authz.BucketFromParam("bucket"), authz.PermObjectWrite), objectHandler.UploadMultipleObjects)  // Upload multiple objects
+		objects.Post("/delete-multiple", az.Require(authz.BucketFromParam("bucket"), authz.PermObjectDelete), objectHandler.DeleteMultipleObjects) // Delete multiple objects
+	}
+
+	// Directory routes (zero-byte directory markers)
+	api.Post("/buckets/:bucket/directories", az.Require(authz.BucketFromParam("bucket"), authz.PermObjectWrite), objectHandler.CreateDirectory)
+
+	// Fiber v3 does not auto-decode wildcard params; fall back to the raw
+	// value when QueryUnescape fails.
+	decodeObjectKey := func(c fiber.Ctx) string {
+		raw := c.Params("*")
+		if decoded, err := url.QueryUnescape(raw); err == nil {
+			return decoded
+		}
+		return raw
+	}
+
+	objectWildcardHandler := func(c fiber.Ctx) error {
+		path := decodeObjectKey(c)
+		switch {
+		case strings.HasSuffix(path, "/metadata"):
+			c.Locals("objectKey", strings.TrimSuffix(path, "/metadata"))
+			return objectHandler.GetObjectMetadata(c)
+		case strings.HasSuffix(path, "/presign"):
+			c.Locals("objectKey", strings.TrimSuffix(path, "/presign"))
+			return objectHandler.GetPresignedURL(c)
+		case strings.HasSuffix(path, "/preview-url"):
+			c.Locals("objectKey", strings.TrimSuffix(path, "/preview-url"))
+			return objectHandler.GetPreviewURL(c)
+		default:
+			c.Locals("objectKey", path)
+			return objectHandler.GetObject(c)
+		}
+	}
+
+	objectDeleteHandler := func(c fiber.Ctx) error {
+		c.Locals("objectKey", decodeObjectKey(c))
+		return objectHandler.DeleteObject(c)
+	}
+
+	objectHeadHandler := func(c fiber.Ctx) error {
+		c.Locals("objectKey", decodeObjectKey(c))
+		return objectHandler.GetObjectMetadata(c)
+	}
+
+	// Register with auth middleware. Although these routes live on app, not
+	// api, the api group's .Use() middlewares (AuthMiddleware, ResolveSubject)
+	// cascade onto them by path prefix, so ResolveSubject is not repeated here
+	// (TestWildcardObjectRoutes_EnforceAuthzViaGroupCascade locks that in).
+	app.Get("/api/v1/buckets/:bucket/objects/*", middleware.AuthMiddleware(&cfg.Auth, authService), az.Require(authz.BucketFromParam("bucket"), authz.PermObjectRead), objectWildcardHandler)
+	app.Delete("/api/v1/buckets/:bucket/objects/*", middleware.AuthMiddleware(&cfg.Auth, authService), az.Require(authz.BucketFromParam("bucket"), authz.PermObjectDelete), objectDeleteHandler)
+	app.Head("/api/v1/buckets/:bucket/objects/*", middleware.AuthMiddleware(&cfg.Auth, authService), az.Require(authz.BucketFromParam("bucket"), authz.PermObjectRead), objectHeadHandler)
+
+	// User/Key management routes
+	users := api.Group("/users")
+	{
+		users.Get("/", az.Require(authz.ScopeNone, authz.PermKeyList), userHandler.ListUsers)                                // List all users/keys
+		users.Post("/", az.Require(authz.ScopeNone, authz.PermKeyCreate), userHandler.CreateUser)                            // Create new user/key
+		users.Get("/:access_key", az.Require(authz.ScopeNone, authz.PermKeyRead), userHandler.GetUser)                       // Get user info
+		users.Get("/:access_key/secret", az.Require(authz.ScopeNone, authz.PermKeyReadSecret), userHandler.GetUserSecretKey) // Get user secret key
+		users.Delete("/:access_key", az.Require(authz.ScopeNone, authz.PermKeyDelete), userHandler.DeleteUser)               // Delete user/key
+		users.Patch("/:access_key", az.Require(authz.ScopeNone, authz.PermKeyUpdate), userHandler.UpdateUserPermissions)     // Update user permissions
+	}
+
+	// Cluster management routes
+	cluster := api.Group("/cluster")
+	{
+		cluster.Get("/health", az.Require(authz.ScopeNone, authz.PermClusterHealth), clusterHandler.GetHealth)                             // Get cluster health
+		cluster.Get("/status", az.Require(authz.ScopeNone, authz.PermClusterStatus), clusterHandler.GetStatus)                             // Get cluster status
+		cluster.Get("/statistics", az.Require(authz.ScopeNone, authz.PermClusterStatistics), clusterHandler.GetStatistics)                 // Get cluster statistics
+		cluster.Get("/nodes/:node_id", az.Require(authz.ScopeNone, authz.PermNodeInfo), clusterHandler.GetNodeInfo)                        // Get node info
+		cluster.Get("/nodes/:node_id/statistics", az.Require(authz.ScopeNone, authz.PermNodeStatistics), clusterHandler.GetNodeStatistics) // Get node statistics
+	}
+
+	// Monitoring routes
+	monitoring := api.Group("/monitoring")
+	{
+		monitoring.Get("/metrics", az.Require(authz.ScopeNone, authz.PermClusterStatistics), monitoringHandler.GetMetrics)            // Get Prometheus metrics
+		monitoring.Get("/admin-health", az.Require(authz.ScopeNone, authz.PermClusterHealth), monitoringHandler.CheckAdminHealth)     // Check Admin API health
+		monitoring.Get("/dashboard", az.Require(authz.ScopeNone, authz.PermClusterStatistics), monitoringHandler.GetDashboardMetrics) // Get dashboard metrics
+	}
+
+	// Admin auth login endpoint (only if admin is enabled)
+	if cfg.Auth.Admin.Enabled {
+		app.Post("/auth/login", authHandler.LoginAdmin)
+	}
+
+	// Token auth login endpoint (only if token auth is enabled)
+	if cfg.Auth.Token.Enabled {
+		app.Post("/auth/login-token", authHandler.LoginToken)
+	}
+
+	// Auth "me" endpoint (if any auth is enabled)
+	if cfg.Auth.Admin.Enabled || cfg.Auth.OIDC.Enabled || cfg.Auth.Token.Enabled {
+		app.Get("/auth/me", middleware.AuthMiddleware(&cfg.Auth, authService), authHandler.GetMe)
+	}
+
+	// OIDC authentication routes (only if OIDC is enabled)
+	if cfg.Auth.OIDC.Enabled {
+		oidcRoutes := app.Group("/auth/oidc")
+		{
+			// Login endpoint - redirects to OIDC provider
+			oidcRoutes.Get("/login", func(c fiber.Ctx) error {
+				state, err := authService.GenerateStateToken()
+				if err != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+						"error": "Failed to generate state token",
+					})
+				}
+
+				authURL, err := authService.GetAuthorizationURL(state)
+				if err != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+						"error": "Failed to generate login URL",
+					})
+				}
+				return c.Redirect().To(authURL)
+			})
+
+			// Callback endpoint - handles OIDC redirect after login
+			oidcRoutes.Get("/callback", func(c fiber.Ctx) error {
+				// Get and validate state token
+				state := c.Query("state")
+				if !authService.ValidateAndConsumeState(state) {
+					return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+						"error": "Invalid or expired state token",
+					})
+				}
+
+				// Get authorization code from query
+				code := c.Query("code")
+				if code == "" {
+					return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+						"error": "Authorization code is required",
+					})
+				}
+
+				// Exchange code for tokens
+				ctx := c.Context()
+				token, err := authService.ExchangeCode(ctx, code)
+				if err != nil {
+					return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+						"error": "Failed to exchange authorization code",
+					})
+				}
+
+				logger.Debug().
+					Str("access_token", token.AccessToken).
+					Interface("token", token).
+					Msg("Exchanged authorization code for token")
+
+				// Extract ID token from OAuth2 token
+				rawIDToken, ok := token.Extra("id_token").(string)
+				if !ok {
+					return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+						"error": "No ID token in response",
+					})
+				}
+
+				// Verify ID token and get user info
+				userInfo, err := authService.VerifyIDToken(ctx, rawIDToken)
+				if err != nil {
+					return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+						"error": "Invalid ID token",
+					})
+				}
+
+				// With access_control configured, non-admin users may log in:
+				// they get team-scoped (possibly zero) permissions and
+				// default-deny protects everything else. Without it, the
+				// admin role remains the only thing standing between an IdP
+				// account and full cluster access, so keep the historical gate.
+				adminRoles := cfg.Auth.OIDC.EffectiveAdminRoles()
+				if len(adminRoles) > 0 {
+					if !authService.IsAdmin(userInfo) {
+						if roles := authService.ExtractRolesFromAccessToken(token.AccessToken); len(roles) > 0 {
+							userInfo.Roles = roles
+						}
+					}
+					if !authService.IsAdmin(userInfo) {
+						if ui, err := authService.GetUserInfo(ctx, token); err == nil && len(ui.Roles) > 0 {
+							userInfo.Roles = ui.Roles
+						}
+					}
+					if cfg.AccessControl == nil && !authService.IsAdmin(userInfo) {
+						logger.Warn().
+							Str("username", userInfo.Username).
+							Strs("required_roles", adminRoles).
+							Strs("roles", userInfo.Roles).
+							Msg("OIDC login denied: user does not have any required admin role")
+						return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+							"error": "User does not have the required admin role",
+						})
+					}
+				}
+
+				// Teams follow the same claim-location fallbacks as roles.
+				if cfg.Auth.OIDC.TeamAttributePath != "" && len(userInfo.Teams) == 0 {
+					if teams := authService.ExtractTeamsFromAccessToken(token.AccessToken); len(teams) > 0 {
+						userInfo.Teams = teams
+					}
+				}
+				if cfg.Auth.OIDC.TeamAttributePath != "" && len(userInfo.Teams) == 0 {
+					if ui, err := authService.GetUserInfo(ctx, token); err == nil && len(ui.Teams) > 0 {
+						userInfo.Teams = ui.Teams
+					}
+				}
+				userInfo.AuthMethod = "oidc"
+
+				// Generate JWT session token
+				sessionToken, err := authService.GenerateSessionToken(userInfo)
+				if err != nil {
+					return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+						"error": "Failed to create session",
+					})
+				}
+
+				// Set JWT session token as secure cookie
+				// Scope the session to the deployment's own subtree. Without a
+				// Path the cookie defaults to "/" and the JWT would be sent to
+				// every other service sharing this hostname - which is exactly
+				// the deployment shape base_path exists for.
+				c.Cookie(&fiber.Cookie{
+					Name:     cfg.Auth.OIDC.CookieName,
+					Value:    sessionToken,
+					Path:     cookiePath,
+					MaxAge:   cfg.Auth.OIDC.SessionMaxAge,
+					Secure:   cfg.Auth.OIDC.CookieSecure,
+					HTTPOnly: cfg.Auth.OIDC.CookieHTTPOnly,
+					SameSite: cfg.Auth.OIDC.CookieSameSite,
+				})
+
+				// Kept for logout's id_token_hint. Only worth carrying when the
+				// provider can end the SSO session, and never readable from JS.
+				if authService.SupportsRPInitiatedLogout() {
+					c.Cookie(&fiber.Cookie{
+						Name:     cfg.Auth.OIDC.IDTokenCookieName(),
+						Value:    rawIDToken,
+						Path:     cookiePath,
+						MaxAge:   cfg.Auth.OIDC.SessionMaxAge,
+						Secure:   cfg.Auth.OIDC.CookieSecure,
+						HTTPOnly: true,
+						SameSite: cfg.Auth.OIDC.CookieSameSite,
+					})
+				}
+
+				// Redirect to frontend with success indicator
+				// Browser-facing, so it carries the public prefix.
+				return c.Redirect().To(config.JoinBasePath(basePath, "/login?login=success"))
+			})
+
+			// Logout endpoint. Clearing the local session leaves the IdP's SSO
+			// session alive, so the next login skips credentials entirely:
+			// hand the frontend the provider's logout URL to finish the job.
+			oidcRoutes.Post("/logout", func(c fiber.Ctx) error {
+				// The session decides, not the enabled auth methods: with admin
+				// and OIDC both on, the frontend calls this for every user and
+				// an admin-password session must not reach the IdP.
+				sessionToken := c.Cookies(cfg.Auth.OIDC.CookieName)
+				if sessionToken == "" {
+					if header := c.Get("Authorization"); strings.HasPrefix(header, "Bearer ") {
+						sessionToken = strings.TrimPrefix(header, "Bearer ")
+					}
+				}
+
+				logoutURL := ""
+				if userInfo, err := authService.ValidateSessionToken(sessionToken); err == nil {
+					// Sessions predating auth_method came from OIDC deployments.
+					if userInfo.AuthMethod == "oidc" || userInfo.AuthMethod == "" {
+						logoutURL = authService.LogoutURL(c.Cookies(cfg.Auth.OIDC.IDTokenCookieName()))
+					}
+				}
+
+				// Clear session and ID token cookies
+				c.Cookie(&fiber.Cookie{
+					Name:   cfg.Auth.OIDC.CookieName,
+					Value:  "",
+					Path:   cookiePath,
+					MaxAge: -1,
+				})
+				c.Cookie(&fiber.Cookie{
+					Name:   cfg.Auth.OIDC.IDTokenCookieName(),
+					Value:  "",
+					Path:   cookiePath,
+					MaxAge: -1,
+				})
+
+				response := fiber.Map{
+					"success": true,
+					"message": "Logged out successfully",
+				}
+				if logoutURL != "" {
+					response["logout_url"] = logoutURL
+				}
+
+				return c.JSON(response)
+			})
+		}
+	}
+
+	if cfg.Server.FrontendPath == "" {
+		cfg.Server.FrontendPath = "./frontend/dist"
+	}
+
+	// The frontend build is deployment-agnostic (relative asset URLs); the
+	// public prefix is injected into index.html so one image can serve any
+	// subpath without a rebuild. Both inputs are fixed at startup, so the
+	// shell is built once here rather than re-read and re-scanned on every
+	// deep link. It is cached for the process lifetime: a rebuilt
+	// index.html needs a restart to be picked up.
+	frontendPath := cfg.Server.FrontendPath
+	indexPath := filepath.Join(frontendPath, "index.html")
+	raw, readErr := os.ReadFile(indexPath)
+	if readErr != nil {
+		// A missing dist and one the service user cannot read fail here the
+		// same way, and used to fail silently (https://github.com/Noooste/garage-ui/issues/127).
+		abs, absErr := filepath.Abs(indexPath)
+		if absErr != nil {
+			abs = indexPath
+		}
+		logger.Warn().Err(readErr).Str("path", abs).Int("uid", os.Getuid()).
+			Msg("frontend not served, every non-API route will return 404")
+		return
+	}
+	shell := InjectBasePath(raw, basePath)
+
+	// SPA fallback - serve index.html for all non-API routes
+	app.Use(func(c fiber.Ctx) error {
+		path := c.Path()
+
+		if strings.HasPrefix(path, "/api/") ||
+			strings.HasPrefix(path, "/auth") ||
+			strings.HasPrefix(path, "/health") ||
+			strings.HasPrefix(path, "/docs") ||
+			path == "/metrics" {
+			logger.Debug().Str("path", path).Msg("API or health check route, skipping SPA fallback")
+			return c.Next()
+		}
+
+		// Try to serve static files first. index.html is deliberately not
+		// served from here: it is the one file that has to go through the
+		// base-path injection below, and requesting it by name would
+		// otherwise hand out the build's placeholder base href.
+		filePath := filepath.Join(frontendPath, path)
+		if info, err := os.Stat(filePath); path != "/index.html" && err == nil && !info.IsDir() {
+			if strings.HasPrefix(path, "/assets/") {
+				c.Set(fiber.HeaderCacheControl, "public, max-age=31536000, immutable")
+			} else {
+				c.Set(fiber.HeaderCacheControl, "no-cache")
+			}
+			return c.SendFile(filePath)
+		}
+
+		c.Set(fiber.HeaderCacheControl, "no-cache")
+		c.Set(fiber.HeaderContentType, fiber.MIMETextHTMLCharsetUTF8)
+		return c.Send(shell)
+	})
+}
+
+var (
+	baseHrefRe = regexp.MustCompile(`(?i)<base[^>]*\shref\s*=\s*"[^"]*"[^>]*>`)
+	baseMetaRe = regexp.MustCompile(`(?i)<meta[^>]*\sname\s*=\s*"garage-ui-base-path"[^>]*>`)
+)
+
+// InjectBasePath rewrites index.html so the SPA knows which public prefix it is
+// reached under:
+//
+//	<base href="/prefix/">                              -> asset + relative URL resolution
+//	<meta name="garage-ui-base-path" content="/prefix">  -> router basename, API baseURL, redirects
+//
+// basePath is the normalized form ("" for root, "/prefix" otherwise). Existing
+// tags are replaced; missing ones are inserted after <head>. Serving from the
+// root yields href="/" and an empty content attribute, i.e. the historical
+// behaviour.
+func InjectBasePath(document []byte, basePath string) []byte {
+	// config.NormalizeBasePath already rejects everything that could break out
+	// of an attribute; escaping here is the second layer, and the one that
+	// holds even if this is ever called with an unvalidated value.
+	escaped := html.EscapeString(basePath)
+	baseTag := []byte(`<base href="` + escaped + `/">`)
+	metaTag := []byte(`<meta name="garage-ui-base-path" content="` + escaped + `">`)
+
+	if baseHrefRe.Match(document) {
+		document = baseHrefRe.ReplaceAllLiteral(document, baseTag)
+	} else {
+		document = insertIntoHead(document, baseTag)
+	}
+
+	if baseMetaRe.Match(document) {
+		document = baseMetaRe.ReplaceAllLiteral(document, metaTag)
+	} else {
+		document = insertIntoHead(document, metaTag)
+	}
+
+	return document
+}
+
+// Insertion anchors in preference order. Anything before the doctype would
+// throw the browser into quirks mode, so a document without <head> still gets
+// the tag after <html> or after the doctype.
+var insertAnchors = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)<head[^>]*>`),
+	regexp.MustCompile(`(?i)<html[^>]*>`),
+	regexp.MustCompile(`(?i)^\s*<!doctype[^>]*>`),
+}
+
+func insertIntoHead(document, tag []byte) []byte {
+	for _, re := range insertAnchors {
+		loc := re.FindIndex(document)
+		if loc == nil {
+			continue
+		}
+		out := make([]byte, 0, len(document)+len(tag))
+		out = append(out, document[:loc[1]]...)
+		out = append(out, tag...)
+		out = append(out, document[loc[1]:]...)
+		return out
+	}
+	return append(tag, document...)
+}
